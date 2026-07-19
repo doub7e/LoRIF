@@ -1,0 +1,37 @@
+cff-version: 1.2.0
+message: "If you use LoRIF, please cite the paper."
+title: "LoRIF: Low-Rank Influence Functions for Scalable Training Data Attribution"
+type: software
+authors:
+  - family-names: Li
+    given-names: Shuangqi
+  - family-names: Le
+    given-names: Hieu
+  - family-names: Xu
+    given-names: Jingyi
+  - family-names: Salzmann
+    given-names: Mathieu
+version: 0.1.0
+date-released: 2026-07-19
+license: Apache-2.0
+identifiers:
+  - type: doi
+    value: "10.48550/arXiv.2601.21929"
+    description: "LoRIF paper"
+preferred-citation:
+  type: article
+  title: "LoRIF: Low-Rank Influence Functions for Scalable Training Data Attribution"
+  authors:
+    - family-names: Li
+      given-names: Shuangqi
+    - family-names: Le
+      given-names: Hieu
+    - family-names: Xu
+      given-names: Jingyi
+    - family-names: Salzmann
+      given-names: Mathieu
+  year: 2026
+  journal: "arXiv preprint arXiv:2601.21929"
+  identifiers:
+    - type: doi
+      value: "10.48550/arXiv.2601.21929"

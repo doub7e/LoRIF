@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=77,<82", "packaging>=24.2"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lorif"
+version = "0.1.0"
+description = "Low-Rank Influence Functions for scalable training data attribution"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+authors = [
+  {name = "Shuangqi Li"},
+  {name = "Hieu Le"},
+  {name = "Jingyi Xu"},
+  {name = "Mathieu Salzmann"},
+]
+dependencies = [
+  "numpy>=1.24",
+  "scipy>=1.10",
+  "torch>=2.1",
+]
+
+[project.optional-dependencies]
+gpt2 = [
+  "accelerate>=0.28",
+  "datasets>=2.18",
+  "transformers>=4.40",
+]
+
+[project.urls]
+Paper = "https://arxiv.org/abs/2601.21929"
+
+[project.scripts]
+lorif = "lorif.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

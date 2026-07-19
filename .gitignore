@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.venv/
+build/
+dist/
+
+# Editors and notebooks
+.idea/
+.vscode/
+.ipynb_checkpoints/
+
+# LoRIF artifacts (large, generated, or external)
+artifacts/*
+!artifacts/README.md
+data/
+cache/
+checkpoints/
+trained_models/
+grad_logs*/
+results/
+outputs/
+*.safetensors
+*.ckpt
+*.bin
+*.pth
+*.pt
+*.pkl
+*.npy
+*.npz
