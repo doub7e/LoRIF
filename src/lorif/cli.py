@@ -14,10 +14,18 @@ from typing import Any
 import numpy as np
 import torch
 
-from .curvature import CurvatureModel, fit_curvature
+from .curvature import (
+    DEFAULT_DAMPING_MULTIPLIER,
+    CurvatureModel,
+    fit_curvature,
+)
 from .influence import influence_scores
 from .lds import linear_datamodeling_score
 from .store import FactorStore
+
+
+CURVATURE_INDEX_FORMAT_VERSION = 2
+SCORE_FORMAT_VERSION = 2
 
 
 def _device(value: str) -> torch.device:
@@ -51,10 +59,36 @@ def _manifest_hash(store: FactorStore) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+def _file_hash(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
 def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
     temporary = path.with_suffix(path.suffix + ".tmp")
     temporary.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
     os.replace(temporary, path)
+
+
+def _curvature_summary(
+    name: str,
+    model: CurvatureModel,
+    *,
+    filename: str | None = None,
+) -> dict[str, Any]:
+    summary = {
+        "name": name,
+        "matrix_shape": list(model.matrix_shape),
+        "rank": model.rank,
+        "damping": model.damping,
+        "damping_policy": model.damping_policy,
+        "mode": model.mode,
+        "tail_variance": model.tail_variance,
+        "spectrum_trace": model.spectrum_trace,
+        "background_damping": model.background_damping,
+    }
+    if filename is not None:
+        summary["file"] = filename
+    return summary
 
 
 def fit_curvature_command(args: argparse.Namespace) -> None:
@@ -68,7 +102,7 @@ def fit_curvature_command(args: argparse.Namespace) -> None:
         spec = store.spec(name)
         print(
             f"[{layer_index + 1}/{len(store.module_names)}] {name}: "
-            f"shape={spec.projected_shape}, rank={args.rank}"
+            f"shape={spec.projected_shape}, rank={args.rank}, mode={args.mode}"
         )
 
         def batches(layer_name=name):
@@ -84,27 +118,19 @@ def fit_curvature_command(args: argparse.Namespace) -> None:
             oversample=args.oversample,
             num_power_iterations=args.power_iterations,
             damping=args.damping,
-            damping_policy=args.damping_policy,
+            damping_multiplier=args.damping_multiplier,
+            mode=args.mode,
             seed=args.seed + layer_index,
             device=device,
             dtype=dtype,
         )
         filename = f"layer-{layer_index:04d}.pt"
         model.save(output / filename)
-        layers.append(
-            {
-                "name": name,
-                "file": filename,
-                "matrix_shape": list(model.matrix_shape),
-                "rank": model.rank,
-                "damping": model.damping,
-                "damping_policy": model.damping_policy,
-            }
-        )
+        layers.append(_curvature_summary(name, model, filename=filename))
 
     manifest = {
         "format": "lorif-curvature-index",
-        "format_version": 1,
+        "format_version": CURVATURE_INDEX_FORMAT_VERSION,
         "source_factor_manifest_sha256": _manifest_hash(store),
         "layers": layers,
         "config": {
@@ -112,9 +138,14 @@ def fit_curvature_command(args: argparse.Namespace) -> None:
             "oversample": args.oversample,
             "power_iterations": args.power_iterations,
             "damping": args.damping,
-            "damping_policy": args.damping_policy,
+            "damping_multiplier": (
+                None if args.damping is not None else args.damping_multiplier
+            ),
+            "damping_policy": layers[0]["damping_policy"],
+            "mode": args.mode,
             "seed": args.seed,
             "dtype": args.dtype,
+            "device": str(device),
         },
     }
     _write_json_atomic(output / "manifest.json", manifest)
@@ -129,7 +160,7 @@ def _load_curvature_index(
     manifest = json.loads(manifest_path.read_text())
     if (
         manifest.get("format") != "lorif-curvature-index"
-        or manifest.get("format_version") != 1
+        or manifest.get("format_version") not in {1, 2}
     ):
         raise ValueError(f"Unsupported curvature index: {manifest_path}")
     return root, {entry["name"]: entry for entry in manifest["layers"]}, manifest
@@ -178,22 +209,31 @@ def score_command(args: argparse.Namespace) -> None:
     train = FactorStore(args.train_index)
     query = FactorStore(args.query_index)
     _validate_indexes(train, query)
-    curvature_root, curvature_entries, curvature_manifest = _load_curvature_index(
-        args.curvature
-    )
-    if set(curvature_entries) != set(train.module_names):
-        raise ValueError("Curvature and factor indexes contain different layers")
-    expected_source = _manifest_hash(train)
-    actual_source = curvature_manifest.get("source_factor_manifest_sha256")
-    if actual_source != expected_source:
-        raise ValueError(
-            "Curvature index was not fitted from this training factor index: "
-            f"{actual_source!r} != {expected_source!r}"
-        )
+    curvature_root = None
+    curvature_entries: dict[str, dict[str, Any]] = {}
+    curvature_manifest: dict[str, Any] | None = None
+    if args.curvature is not None:
+        (
+            curvature_root,
+            curvature_entries,
+            curvature_manifest,
+        ) = _load_curvature_index(args.curvature)
+        if set(curvature_entries) != set(train.module_names):
+            raise ValueError("Curvature and factor indexes contain different layers")
+        expected_source = _manifest_hash(train)
+        actual_source = curvature_manifest.get("source_factor_manifest_sha256")
+        if actual_source != expected_source:
+            raise ValueError(
+                "Curvature index was not fitted from this training factor index: "
+                f"{actual_source!r} != {expected_source!r}"
+            )
 
     output = _prepare_output(args.output)
     device = _device(args.device)
     dtype = _dtype(args.dtype)
+    inline_curvature = curvature_root is None
+    fit_dtype = _dtype(args.fit_dtype) if inline_curvature else None
+    curvature_summaries = []
     shards = [
         {
             "index": shard_index,
@@ -204,15 +244,53 @@ def score_command(args: argparse.Namespace) -> None:
         for shard_index in range(train.num_shards)
     ]
     # Process one layer at a time: a paper-scale D x r curvature matrix can be
-    # several GiB, so all layers must never be resident on the accelerator.
+    # several GiB. By default it is fitted, consumed, and released here without
+    # ever being serialized.
     for layer_index, name in enumerate(train.module_names):
-        print(f"[{layer_index + 1}/{len(train.module_names)}] scoring layer {name}")
+        if inline_curvature:
+            spec = train.spec(name)
+            print(
+                f"[{layer_index + 1}/{len(train.module_names)}] "
+                f"fitting and scoring layer {name}: "
+                f"shape={spec.projected_shape}, rank={args.rank}, mode={args.mode}"
+            )
+
+            def batches(layer_name=name):
+                return train.iter_layer(
+                    layer_name,
+                    device=device,
+                    dtype=fit_dtype,
+                    mmap=args.mmap,
+                )
+
+            curvature = fit_curvature(
+                batches,
+                spec.projected_shape,
+                num_examples=train.num_examples,
+                rank=args.rank,
+                oversample=args.oversample,
+                num_power_iterations=args.power_iterations,
+                damping=args.damping,
+                damping_multiplier=args.damping_multiplier,
+                mode=args.mode,
+                seed=args.seed + layer_index,
+                device=device,
+                dtype=fit_dtype,
+            )
+            curvature_summaries.append(_curvature_summary(name, curvature))
+            curvature = curvature.to(device=device, dtype=dtype)
+        else:
+            print(
+                f"[{layer_index + 1}/{len(train.module_names)}] "
+                f"scoring layer {name} from cached curvature"
+            )
+            curvature = CurvatureModel.load(
+                curvature_root / curvature_entries[name]["file"],
+                device=device,
+                dtype=dtype,
+            )
+
         query_factors = query.load_layer(name, device=device, dtype=dtype)
-        curvature = CurvatureModel.load(
-            curvature_root / curvature_entries[name]["file"],
-            device=device,
-            dtype=dtype,
-        )
         for shard in shards:
             shard_index = shard["index"]
             start, end = shard["start"], shard["end"]
@@ -232,6 +310,8 @@ def score_command(args: argparse.Namespace) -> None:
             temporary = path.with_suffix(".pt.tmp")
             torch.save(contribution, temporary)
             os.replace(temporary, path)
+            del contribution, train_factors
+        del curvature, query_factors
 
     # The layer-major loop above bounds accelerator memory by one layer. Score
     # shards are atomically accumulated on disk between layers.
@@ -242,16 +322,56 @@ def score_command(args: argparse.Namespace) -> None:
             f"finalized train rows [{start}, {end})"
         )
 
+    if inline_curvature:
+        curvature_source = "inline"
+        curvature_mode = args.mode
+        curvature_config = {
+            "requested_rank": args.rank,
+            "oversample": args.oversample,
+            "power_iterations": args.power_iterations,
+            "damping": args.damping,
+            "damping_multiplier": (
+                None if args.damping is not None else args.damping_multiplier
+            ),
+            "damping_policy": (
+                "explicit" if args.damping is not None else "trace-mean"
+            ),
+            "mode": args.mode,
+            "seed": args.seed,
+            "fit_dtype": args.fit_dtype,
+            "device": str(device),
+        }
+    else:
+        curvature_source = "index"
+        curvature_mode = curvature_manifest.get("config", {}).get(
+            "mode",
+            "truncated"
+            if curvature_manifest.get("format_version") == 1
+            else "unknown",
+        )
+        curvature_config = curvature_manifest.get("config", {})
+
     manifest = {
         "format": "lorif-scores",
-        "format_version": 1,
+        "format_version": SCORE_FORMAT_VERSION,
         "num_queries": query.num_examples,
         "num_train": train.num_examples,
         "train_factor_manifest_sha256": _manifest_hash(train),
         "query_factor_manifest_sha256": _manifest_hash(query),
+        "curvature_source": curvature_source,
+        "curvature_mode": curvature_mode,
+        "curvature_config": curvature_config,
         "shards": shards,
         "dtype": "float32",
+        "score_dtype": args.dtype,
+        "device": str(device),
     }
+    if inline_curvature:
+        manifest["curvature_layers"] = curvature_summaries
+    else:
+        manifest["curvature_manifest_sha256"] = _file_hash(
+            curvature_root / "manifest.json"
+        )
     _write_json_atomic(output / "manifest.json", manifest)
     print(f"Saved score shards to {output}")
 
@@ -394,6 +514,45 @@ def pack_subsets_command(args: argparse.Namespace) -> None:
     print(f"Packed {len(subsets)} subsets into {args.output}")
 
 
+def _add_curvature_fit_options(
+    parser: argparse.ArgumentParser,
+    *,
+    group_title: str | None = None,
+):
+    target = (
+        parser
+        if group_title is None
+        else parser.add_argument_group(
+            group_title,
+            "These options are ignored when --curvature supplies a saved index.",
+        )
+    )
+    target.add_argument("--oversample", type=int, default=10)
+    target.add_argument("--power-iterations", type=int, default=3)
+    target.add_argument(
+        "--damping",
+        type=float,
+        help="Explicit per-layer lambda; overrides --damping-multiplier",
+    )
+    target.add_argument(
+        "--damping-multiplier",
+        type=float,
+        default=DEFAULT_DAMPING_MULTIPLIER,
+        help=(
+            "Multiplier in lambda = multiplier * trace(G.T @ G) / D "
+            f"(default: {DEFAULT_DAMPING_MULTIPLIER})"
+        ),
+    )
+    target.add_argument(
+        "--mode",
+        choices=["tail-corrected", "truncated"],
+        default="truncated",
+        help="Spectral approximation outside the retained rank (default: truncated)",
+    )
+    target.add_argument("--seed", type=int, default=0)
+    return target
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="lorif", description="Low-rank influence functions for data attribution"
@@ -401,17 +560,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--version", action="version", version="%(prog)s 0.1.0")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    fit = subparsers.add_parser("fit-curvature", help="Fit per-layer truncated SVDs")
+    fit = subparsers.add_parser(
+        "fit-curvature",
+        help="Explicitly fit and save reusable curvature approximations",
+    )
     fit.add_argument("index", help="Training factor index")
     fit.add_argument("output", help="New curvature output directory")
     fit.add_argument("--rank", type=int, required=True)
-    fit.add_argument("--oversample", type=int, default=10)
-    fit.add_argument("--power-iterations", type=int, default=3)
-    fit.add_argument("--damping", type=float)
-    fit.add_argument(
-        "--damping-policy", choices=["paper", "legacy-gpt2"], default="paper"
-    )
-    fit.add_argument("--seed", type=int, default=0)
+    _add_curvature_fit_options(fit)
     fit.add_argument("--device", default="auto")
     fit.add_argument(
         "--dtype", choices=["float32", "float64"], default="float32"
@@ -420,12 +576,36 @@ def build_parser() -> argparse.ArgumentParser:
     fit.set_defaults(func=fit_curvature_command)
 
     score = subparsers.add_parser(
-        "score", help="Score query factors against training factors"
+        "score",
+        help="Fit or reuse curvature and score query factors",
+        description=(
+            "With --rank, fit and consume one layer's curvature at a time without "
+            "saving it. Use --curvature to reuse an explicitly saved index."
+        ),
     )
     score.add_argument("train_index")
     score.add_argument("query_index")
-    score.add_argument("curvature")
     score.add_argument("output")
+    curvature_source = score.add_mutually_exclusive_group(required=True)
+    curvature_source.add_argument(
+        "--rank",
+        type=int,
+        help="Fit this rank in memory; the curvature tensors are not saved",
+    )
+    curvature_source.add_argument(
+        "--curvature",
+        help="Reuse an explicitly saved curvature index instead of fitting",
+    )
+    inline_fit = _add_curvature_fit_options(
+        score,
+        group_title="inline curvature fitting (with --rank)",
+    )
+    inline_fit.add_argument(
+        "--fit-dtype",
+        choices=["float32", "float64"],
+        default="float32",
+        help="Dtype used by the in-memory randomized SVD (default: float32)",
+    )
     score.add_argument("--device", default="auto")
     score.add_argument(
         "--dtype", choices=["float32", "bfloat16"], default="float32"

@@ -31,6 +31,8 @@ gpt2 = [
 
 [project.urls]
 Paper = "https://arxiv.org/abs/2601.21929"
+Repository = "https://github.com/doub7e/LoRIF"
+Issues = "https://github.com/doub7e/LoRIF/issues"
 
 [project.scripts]
 lorif = "lorif.cli:main"

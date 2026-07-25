@@ -1,70 +1,49 @@
 # LoRIF
 
-Official implementation of **LoRIF: Low-Rank Influence Functions for Scalable
-Training Data Attribution**.
+Official PyTorch implementation of
+**[LoRIF: Low-Rank Influence Functions for Scalable Training Data Attribution](https://arxiv.org/abs/2601.21929)**.
 
-[[Paper](https://arxiv.org/abs/2601.21929)]
+LoRIF makes influence functions practical for large models by combining two
+low-rank approximations:
 
-LoRIF combines two low-rank approximations:
+1. each projected per-example gradient is stored as rank-`c` matrix factors;
+2. each layer's curvature is approximated with a streaming rank-`r` randomized
+   SVD.
 
-1. It stores each two-sided projected per-example gradient as rank-`c` factors.
-2. It represents each layer's Gauss–Newton curvature with a rank-`r` truncated
-   SVD and applies its inverse through the Woodbury identity.
-
-This repository is deliberately small: the method, one GPT-2 example, and
-focused correctness tests. It contains no model checkpoints, datasets, gradient
-indexes, or score matrices.
+The implementation is deliberately small. It contains the reusable LoRIF
+library and one end-to-end GPT-2/WikiText-103 workflow. Model checkpoints,
+datasets, factor indexes, and LDS subset checkpoints are not included.
 
 ## Install
 
 ```bash
 python -m pip install --upgrade pip
-python -m pip install -e .
-```
-
-For the GPT-2/WikiText example:
-
-```bash
 python -m pip install -e ".[gpt2]"
 ```
 
-Python 3.10+ and PyTorch 2.1+ are required.
-
-## 10-second CPU example
-
-This runs end to end without downloading a model or dataset:
-
-```bash
-PYTHONPATH=src python examples/minimal.py
-```
-
-It creates synthetic low-rank gradients, fits the curvature approximation, and
-attributes two queries to eight training examples.
+LoRIF requires Python 3.10+ and PyTorch 2.1+.
 
 ## GPT-2 on WikiText-103
 
-The full pipeline prepares token blocks, indexes train/query gradients, fits
-curvature, and scores influence.
+The commands below use the paper's low-storage configuration
+`f=16, c=1, r=2048`.
 
-### 1. Prepare the paper's token blocks
+### 1. Prepare the paper data
 
 ```bash
 python examples/gpt2.py prepare-wikitext artifacts/train.pt --split train
 python examples/gpt2.py prepare-wikitext artifacts/query.pt --split validation
 ```
 
-The default recipe exactly follows the paper training code: remove blank rows,
-join groups of 1,000 rows with two newlines, concatenate the resulting token
-streams, then create fixed 512-token blocks. The commands verify the expected
-counts (232,585 train and 487 validation) and selected block hashes, and fail if
-the dataset/tokenizer snapshot is incompatible.
+This removes blank WikiText-103 rows, joins groups of 1,000 rows with two
+newlines, and slices the global GPT-2 token stream into fixed 512-token blocks.
+The script checks the expected paper data: 232,585 training blocks and 487
+validation blocks.
 
-The `index` and LDS commands also accept legacy trusted pickle caches directly.
-Do not load pickle files from untrusted sources.
+### 2. Index projected gradients
 
-### 2. Store projected gradient factors
-
-Set `MODEL` to the same final GPT-2 checkpoint for both indexes:
+Use the same final full-data GPT-2 checkpoint for the training and query
+indexes:
 
 ```bash
 MODEL=/external/path/to/final-gpt2-checkpoint
@@ -80,76 +59,114 @@ python examples/gpt2.py index "$MODEL" \
   --projection-factor 16 --factor-rank 1 --batch-size 64
 ```
 
+Reduce `--batch-size` if needed; it controls the indexing working set. The
+indexer tracks the 48 GPT-2 attention/MLP weight matrices and uses token-summed
+causal cross-entropy. It computes factors in FP32, writes BF16 shards, and
+records model, tokenizer, data, projection, and loss metadata.
+
 The paper checkpoint is not committed because of its size. A Hugging Face GPT-2
-model ID may be used for a method demo, but it will not reproduce paper scores.
-For local checkpoints, the indexer hashes model config and weight files; for Hub
-models it records resolved model/tokenizer revisions. Scoring rejects mismatched
-checkpoints or projection settings.
+model ID can be used to try the pipeline, but it will not reproduce paper
+results.
 
-The example tracks attention/MLP matrices, uses token-summed causal
-cross-entropy, computes factors in FP32, and stores them in BF16. Low-rank
-factorization happens during each layer's backward hook and is offloaded to CPU,
-so dense projected gradients do not accumulate across layers.
+### 3. Fit curvature and score influence
 
-### 3. Fit curvature
+```bash
+lorif score \
+  artifacts/train-f16-c1 artifacts/query-f16-c1 artifacts/scores \
+  --rank 2048 --device cuda
+```
+
+This is the default, disk-efficient path. For each layer, LoRIF streams the
+training factor shards through randomized SVD, scores that layer, and releases
+its curvature before moving to the next layer. Curvature vectors and singular
+values are not saved; only score shards and small reproducibility metadata are
+written.
+
+Larger scores indicate stronger proponents under the paper's convention.
+
+### Optional: reuse a curvature index
+
+Save curvature only when several query indexes will reuse it:
 
 ```bash
 lorif fit-curvature artifacts/train-f16-c1 artifacts/curvature-r2048 \
   --rank 2048 --device cuda
+
+lorif score \
+  artifacts/train-f16-c1 artifacts/query-f16-c1 artifacts/scores \
+  --curvature artifacts/curvature-r2048 --device cuda
 ```
 
-The index is streamed through randomized SVD. Defaults match the paper:
-oversampling `p=10`, three power iterations after the initial covariance
-multiply, and
+## Defaults and paper configurations
+
+The release defaults are:
+
+| Setting | Default |
+|---|---:|
+| per-example factor iterations | 8 for `c=1`; 16 for `c>1` |
+| randomized-SVD oversampling | `p=10` |
+| randomized-SVD power iterations | 3 |
+| curvature mode | `truncated` |
+| damping | `0.5 * trace(G.T @ G) / D` |
+| curvature persistence | off |
+
+Here `G` is the per-layer matrix of projected training gradients and `D` is its
+feature dimension. Truncated mode retains curvature in the top-`r` subspace;
+the complementary subspace keeps inverse weight `1 / lambda`. Tail correction
+is a post-paper ablation and remains opt-in with `--mode tail-corrected`.
+
+The GPT-2 settings reported in Table 1 of the paper are:
+
+| Storage regime | `f` | `c` | `r` | Paper LDS |
+|---|---:|---:|---:|---:|
+| Low | 16 | 1 | 2,048 | 0.1392 |
+| Medium | 4 | 1 | 4,096 | 0.2073 |
+| High | 4 | 32 | 16,384 | 0.3428 |
+
+Choose the smallest projection factor `f` that fits storage, keep `c=1` unless
+more per-example fidelity is needed, and then increase `r` as the curvature
+budget allows.
+
+### Reproducibility note
+
+The paper experiments used
+`lambda = 0.1 * mean(sigma[:r+p] ** 2)`. Post-paper validation found the
+full-trace rule above to be a more stable release default:
 
 ```text
-lambda = 0.1 * mean(sigma[:r+p] ** 2)
+lambda = 0.5 * trace(G.T @ G) / D
 ```
 
-Every randomized-SVD pass checks the exact row count and matrix layout.
+Thus the workflow and the `f/c/r` configurations align with the paper, while
+exact Table 1 values additionally require the authors' original final checkpoint,
+subset checkpoints, and historical damping artifacts. The historical automatic
+policy is intentionally not exposed by this minimal release. Tune the release
+rule with `--damping-multiplier`, or pass an explicit `--damping`.
 
-### 4. Score influence
+## Memory and artifact behavior
 
-```bash
-lorif score \
-  artifacts/train-f16-c1 artifacts/query-f16-c1 \
-  artifacts/curvature-r2048 artifacts/scores \
-  --device cuda
-```
+- Prepared `.pt` token blocks are memory-mapped and consumed by a `DataLoader`;
+  indexing does not convert the full corpus into Python objects.
+- Gradient factors are written in aligned shards (`--shard-size`, default
+  10,000 examples).
+- Every randomized-SVD pass reads one factor shard at a time. It never
+  materializes the full training gradient matrix `G`.
+- Scoring loads the small query set for one layer and streams training shards.
+- The default `lorif score --rank ...` path never saves curvature tensors.
+- Commands refuse to overwrite non-empty artifact directories.
 
-Scores are summed over layers and written in training-order shards. Larger
-scores are proponents under the paper's convention. Only one layer's query
-factors and curvature are placed on the accelerator at once. Scoring supports
-FP32 (default) and BF16; FP16 is rejected because squared singular values can
-overflow its limited exponent range.
+The GPT-2 helper and LDS loader also accept legacy pickle artifacts. Pickle files
+are loaded eagerly and must never come from an untrusted source.
 
-## Paper configurations
+## LDS evaluation
 
-`f` is the projection factor, `c` the per-example factor rank, and `r` the
-curvature rank.
+The paper evaluates 100 random 50% training subsets and averages validation loss
+over five training runs per subset. This release stores mean next-token loss;
+for the fixed 512-token paper blocks, the historical token-sum cache differs
+only by the constant factor 511 and gives identical Spearman LDS. The 500 subset
+checkpoints are intentionally kept outside this repository.
 
-| GPT-2 regime | `f` | `c` | `r` |
-|---|---:|---:|---:|
-| Low storage | 16 | 1 | 2,048 |
-| Medium | 4 | 1 | 4,096 |
-| High quality | 4 | 32 | 16,384 |
-
-Rank `c=1` is the recommended cost-efficient default. Choose the smallest `f`
-that fits storage, then increase `r`; increase `c` only when additional
-per-example fidelity is worth the storage.
-
-## LDS evaluation without committing 500 checkpoints
-
-The GPT-2 LDS experiment uses 100 independently sampled 50% training subsets
-and averages validation losses over five runs per subset. The 500 checkpoints
-occupy hundreds of GiB and are intentionally external.
-
-Convert them once into:
-
-- an averaged loss matrix `[100, 487]`;
-- a packed included-example matrix `[100, 232585]`.
-
-Compute losses from checkpoints stored elsewhere:
+Convert them once into a small loss matrix:
 
 ```bash
 python examples/gpt2.py subset-losses \
@@ -162,87 +179,40 @@ python examples/gpt2.py subset-losses \
   --device cuda
 ```
 
-Pack the JSON index files. Each file contains examples **included** in its
-training subset:
+Pack each subset's included-example JSON file and evaluate:
 
 ```bash
 lorif pack-subsets /external/checkpoints/indices artifacts/subsets.npz \
   --num-train 232585
-```
 
-Evaluate:
-
-```bash
 lorif evaluate-lds \
   artifacts/scores artifacts/subsets.npz artifacts/subset-losses.npz \
   --values-are losses --device cuda
 ```
 
-The evaluator computes, for every query,
+The evaluator reports the mean per-query Spearman correlation and a
+query-bootstrap confidence interval. It converts losses to utility internally,
+so higher LoRIF scores consistently mean stronger proponents.
+
+## Repository layout
 
 ```text
-Spearman(actual utility, sum of included-example influence)
+src/lorif/
+  collector.py   projected per-example gradients
+  factors.py     rank-c factor algebra
+  store.py       sharded factor storage
+  curvature.py   streaming randomized SVD
+  influence.py   low-rank inverse scoring
+  lds.py         LDS metric
+  cli.py         command-line workflow
+examples/
+  gpt2.py        WikiText-103 preparation, indexing, and subset losses
 ```
 
-where utility is negative cross-entropy. It reports the mean and a query-level
-percentile-bootstrap interval (5,000 resamples, seed 12,345). This removes the
-legacy evaluator's inconsistent output sign. See [VALIDATION.md](VALIDATION.md)
-for the checks performed against the available legacy artifacts.
-
-## Compatibility and artifact safety
-
-- `--projection-normalization legacy` reproduces the GPT-2 prototype's
-  Rademacher seed/layout stream and `+/-1/d` scaling (with the default seed 0).
-  `jl` selects conventional `+/-1/sqrt(d)` scaling and a portable CPU stream.
-- `fit-curvature` uses the paper damping rule by default. Pass
-  `--damping-policy legacy-gpt2` only for the older notebook rule
-  `0.01 * log2(r) * mean(sigma[:r] ** 2)`.
-- New factors use the paper's input-by-output matrix layout. The prototype used
-  its transpose, which is mathematically equivalent when applied consistently;
-  raw prototype factor shards are not silently accepted.
-- Factor and curvature tensors are loaded with PyTorch's restricted
-  `weights_only=True` loader. Manifests bind model identity, ordered layers,
-  projection settings, factor rank/layout, loss reduction, dtype, and shard
-  ranges. The actual ordered projection tensors are hashed, so different device
-  RNG streams cannot be mixed. Curvature is cryptographically bound to its
-  training-factor manifest.
-- Commands refuse to overwrite non-empty artifact directories.
-
-## Python API
-
-The CLI is a thin wrapper over pure tensor operations:
-
-```python
-from lorif import Factors, fit_curvature, influence_scores
-```
-
-`Factors.left` is `[batch, projected_input, c]`, `Factors.right` is
-`[batch, projected_output, c]`, and the dense gradient is
-`left @ right.transpose(1, 2)`. See [examples/minimal.py](examples/minimal.py)
-for a complete runnable use of the API.
-
-`GradientCollector` can attach to explicitly selected `nn.Linear` layers. The
-caller owns the forward pass and loss, making custom loss masks and
-non-language applications straightforward.
-
-## Validation
-
-Run all CPU correctness tests with no downloads:
-
-```bash
-PYTHONPATH=src python -m unittest discover -s tests -v
-```
-
-The suite checks projected gradients against per-example autograd, rank-`c`
-factor algebra, full/truncated Woodbury scores against dense solves, streaming
-and shard invariants, provenance rejection, GPT-2 conversion/preprocessing, and
-LDS sign/bootstrap behavior.
-
-An optional CUDA check is available for a GPU worker:
-
-```bash
-PYTHONPATH=src python tests/gpu_smoke.py
-```
+The default `legacy` projection normalization reproduces the original GPT-2
+prototype's Rademacher layout, seed stream, and `+/-1/d` scaling. Factor
+manifests hash the actual projections and bind model/data metadata so
+incompatible training and query indexes are rejected.
 
 ## Citation
 

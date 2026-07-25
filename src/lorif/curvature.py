@@ -1,4 +1,4 @@
-"""Streaming truncated-SVD curvature approximation for LoRIF."""
+"""Streaming spectral curvature approximation for LoRIF."""
 
 from __future__ import annotations
 
@@ -12,19 +12,24 @@ import torch
 from .factors import Factors
 
 
-DampingPolicy = Literal["paper", "legacy-gpt2"]
+CurvatureMode = Literal["tail-corrected", "truncated"]
 BatchFactory = Callable[[], Iterable[Factors]]
+CURVATURE_FORMAT_VERSION = 2
+DEFAULT_DAMPING_MULTIPLIER = 0.5
 
 
 @dataclass(frozen=True)
 class CurvatureModel:
-    """Per-layer right-singular subspace and damping used by Eq. (9)."""
+    """Per-layer spectral approximation used for influence scoring."""
 
     matrix_shape: tuple[int, int]
     right_vectors: torch.Tensor
     singular_values: torch.Tensor
     damping: float
-    damping_policy: str = "paper"
+    mode: CurvatureMode = "truncated"
+    tail_variance: float = 0.0
+    spectrum_trace: float | None = None
+    damping_policy: str = "unspecified"
 
     def __post_init__(self) -> None:
         rows, columns = self.matrix_shape
@@ -46,10 +51,26 @@ class CurvatureModel:
             raise ValueError("Curvature tensors must use a floating-point dtype")
         if not math.isfinite(self.damping) or self.damping <= 0:
             raise ValueError("damping must be finite and positive")
+        if self.mode not in {"tail-corrected", "truncated"}:
+            raise ValueError(f"Unknown curvature mode: {self.mode}")
+        if not math.isfinite(self.tail_variance) or self.tail_variance < 0:
+            raise ValueError("tail_variance must be finite and non-negative")
+        if self.mode == "truncated" and self.tail_variance != 0:
+            raise ValueError("truncated mode requires tail_variance=0")
+        if self.spectrum_trace is not None and (
+            not math.isfinite(self.spectrum_trace) or self.spectrum_trace < 0
+        ):
+            raise ValueError("spectrum_trace must be finite and non-negative")
 
     @property
     def rank(self) -> int:
         return int(self.singular_values.numel())
+
+    @property
+    def background_damping(self) -> float:
+        """Inverse denominator for directions outside the retained subspace."""
+
+        return self.damping + self.tail_variance
 
     def to(self, *args, **kwargs) -> "CurvatureModel":
         return CurvatureModel(
@@ -57,6 +78,9 @@ class CurvatureModel:
             right_vectors=self.right_vectors.to(*args, **kwargs),
             singular_values=self.singular_values.to(*args, **kwargs),
             damping=self.damping,
+            mode=self.mode,
+            tail_variance=self.tail_variance,
+            spectrum_trace=self.spectrum_trace,
             damping_policy=self.damping_policy,
         )
 
@@ -64,11 +88,14 @@ class CurvatureModel:
         torch.save(
             {
                 "format": "lorif-curvature",
-                "format_version": 1,
+                "format_version": CURVATURE_FORMAT_VERSION,
                 "matrix_shape": self.matrix_shape,
                 "right_vectors": self.right_vectors.detach().cpu(),
                 "singular_values": self.singular_values.detach().cpu(),
                 "damping": self.damping,
+                "mode": self.mode,
+                "tail_variance": self.tail_variance,
+                "spectrum_trace": self.spectrum_trace,
                 "damping_policy": self.damping_policy,
             },
             path,
@@ -83,45 +110,57 @@ class CurvatureModel:
         dtype: torch.dtype | None = None,
     ) -> "CurvatureModel":
         payload = torch.load(path, map_location="cpu", weights_only=True)
-        if (
-            payload.get("format") != "lorif-curvature"
-            or payload.get("format_version") != 1
-        ):
+        version = payload.get("format_version")
+        if payload.get("format") != "lorif-curvature" or version not in {1, 2}:
             raise ValueError(f"Unsupported curvature file: {path}")
         vectors = payload["right_vectors"].to(device=device, dtype=dtype)
         values = payload["singular_values"].to(device=device, dtype=dtype)
+        if version == 1:
+            mode = "truncated"
+            tail_variance = 0.0
+            spectrum_trace = None
+        else:
+            mode = str(payload["mode"])
+            tail_variance = float(payload["tail_variance"])
+            raw_trace = payload.get("spectrum_trace")
+            spectrum_trace = None if raw_trace is None else float(raw_trace)
         return cls(
             matrix_shape=tuple(payload["matrix_shape"]),
             right_vectors=vectors,
             singular_values=values,
             damping=float(payload["damping"]),
+            mode=mode,
+            tail_variance=tail_variance,
+            spectrum_trace=spectrum_trace,
             damping_policy=str(payload.get("damping_policy", "unknown")),
         )
 
 
-def damping_from_spectrum(
-    singular_values: torch.Tensor,
-    *,
-    target_rank: int,
-    policy: DampingPolicy = "paper",
+def damping_from_trace(
+    spectrum_trace: float,
+    dimension: int,
+    multiplier: float = DEFAULT_DAMPING_MULTIPLIER,
 ) -> float:
-    """Compute layer damping from the randomized-SVD candidate spectrum."""
+    """Return ``multiplier * trace(G.T @ G) / D``."""
 
-    if singular_values.ndim != 1 or singular_values.numel() == 0:
-        raise ValueError("singular_values must be a non-empty vector")
-    if target_rank <= 0 or target_rank > singular_values.numel():
-        raise ValueError("target_rank is outside the available spectrum")
-    eigenvalues = singular_values.square()
-    if policy == "paper":
-        damping = 0.1 * eigenvalues.mean()
-    elif policy == "legacy-gpt2":
-        damping = 0.01 * math.log2(target_rank) * eigenvalues[:target_rank].mean()
-    else:
-        raise ValueError(f"Unknown damping policy: {policy}")
-    result = float(damping.item())
+    if not math.isfinite(spectrum_trace) or spectrum_trace <= 0:
+        raise ValueError("spectrum_trace must be finite and positive")
+    if dimension <= 0:
+        raise ValueError("dimension must be positive")
+    if not math.isfinite(multiplier) or multiplier <= 0:
+        raise ValueError("damping multiplier must be finite and positive")
+    result = float(multiplier * spectrum_trace / dimension)
     if not math.isfinite(result) or result <= 0:
         raise ValueError("The estimated damping is not positive; check the gradients")
     return result
+
+
+def _squared_frobenius_sum(factors: Factors) -> torch.Tensor:
+    """Compute ``sum_n ||L_n R_n.T||_F^2`` without a dense square buffer."""
+
+    left_gram = torch.bmm(factors.left.transpose(1, 2), factors.left)
+    right_gram = torch.bmm(factors.right.transpose(1, 2), factors.right)
+    return (left_gram * right_gram).sum(dtype=torch.float64)
 
 
 def _orthonormalize(matrix: torch.Tensor) -> torch.Tensor:
@@ -172,7 +211,8 @@ def fit_curvature(
     oversample: int = 10,
     num_power_iterations: int = 3,
     damping: float | None = None,
-    damping_policy: DampingPolicy = "paper",
+    damping_multiplier: float = DEFAULT_DAMPING_MULTIPLIER,
+    mode: CurvatureMode = "truncated",
     seed: int = 0,
     device: torch.device | str = "cpu",
     dtype: torch.dtype = torch.float32,
@@ -190,8 +230,18 @@ def fit_curvature(
         raise ValueError("matrix_shape and num_examples must be positive")
     if rank <= 0 or oversample < 0 or num_power_iterations < 0:
         raise ValueError("rank must be positive; oversample/iterations non-negative")
+    if mode not in {"tail-corrected", "truncated"}:
+        raise ValueError(f"Unknown curvature mode: {mode}")
     if dtype not in {torch.float32, torch.float64}:
         raise ValueError("Curvature fitting requires float32 or float64")
+    if damping is not None and (
+        not math.isfinite(damping) or damping <= 0
+    ):
+        raise ValueError("damping must be finite and positive")
+    if damping is None and (
+        not math.isfinite(damping_multiplier) or damping_multiplier <= 0
+    ):
+        raise ValueError("damping multiplier must be finite and positive")
     actual_rank = min(rank, dimension, num_examples)
     candidate_rank = min(actual_rank + oversample, dimension, num_examples)
     device = torch.device(device)
@@ -230,15 +280,16 @@ def fit_curvature(
     rayleigh = torch.zeros(
         candidate_rank, candidate_rank, device=device, dtype=dtype
     )
+    trace = torch.zeros((), device=device, dtype=torch.float64)
     seen = 0
     for factors in batches():
         if factors.shape != matrix_shape:
             raise ValueError(
                 f"Gradient matrix shape changed: {factors.shape} != {matrix_shape}"
             )
-        dense = factors.to(device=device, dtype=dtype).dense().reshape(
-            factors.batch_size, dimension
-        )
+        device_factors = factors.to(device=device, dtype=dtype)
+        trace.add_(_squared_frobenius_sum(device_factors))
+        dense = device_factors.dense().reshape(factors.batch_size, dimension)
         projected = dense @ basis
         rayleigh.add_(projected.transpose(0, 1) @ projected)
         seen += factors.batch_size
@@ -253,22 +304,32 @@ def fit_curvature(
     rotation = rotation[:, order]
     candidate_singular_values = eigenvalues.sqrt()
 
+    trace_value = float(trace.item())
     if damping is None:
-        damping_value = damping_from_spectrum(
-            candidate_singular_values,
-            target_rank=actual_rank,
-            policy=damping_policy,
+        damping_value = damping_from_trace(
+            trace_value,
+            dimension,
+            damping_multiplier,
         )
-        policy_name = damping_policy
+        policy_name = "trace-mean"
     else:
         damping_value = float(damping)
         policy_name = "explicit"
     vectors = basis @ rotation[:, :actual_rank]
     values = candidate_singular_values[:actual_rank]
+    if mode == "tail-corrected" and actual_rank < dimension:
+        top_energy = float(values.square().sum(dtype=torch.float64).item())
+        residual = max(trace_value - top_energy, 0.0)
+        tail_variance = residual / (dimension - actual_rank)
+    else:
+        tail_variance = 0.0
     return CurvatureModel(
         matrix_shape=matrix_shape,
         right_vectors=vectors,
         singular_values=values,
         damping=damping_value,
+        mode=mode,
+        tail_variance=tail_variance,
+        spectrum_trace=trace_value,
         damping_policy=policy_name,
     )

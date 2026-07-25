@@ -36,11 +36,13 @@ def influence_scores(
     train_projected = project_factors(train, curvature.right_vectors)
     singular_sq = curvature.singular_values.square()
 
-    # Algebraically this is Eq. (9), split into the component orthogonal to V
-    # and the damped component within V. It avoids forming s^2 / (lambda+s^2),
-    # which can round to exactly one in FP16/BF16 and erase a valid score.
+    # Split the inverse into the component orthogonal to V and the component
+    # within V. Tail correction changes only the orthogonal denominator:
+    # top-r directions still use 1 / (lambda + sigma_i^2).
+    # This form also avoids s^2 / (lambda+s^2), which can round to exactly one
+    # in FP16/BF16 and erase a valid score.
     projected_direct = query_projected @ train_projected.transpose(0, 1)
-    orthogonal = (direct - projected_direct) / curvature.damping
+    orthogonal = (direct - projected_direct) / curvature.background_damping
     within = (query_projected / (curvature.damping + singular_sq)) @ (
         train_projected.transpose(0, 1)
     )

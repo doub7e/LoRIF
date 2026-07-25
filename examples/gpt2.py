@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Minimal GPT-2/WikiText example for building LoRIF factor indexes.
+"""GPT-2/WikiText example for building and evaluating LoRIF indexes.
 
 This file intentionally contains model/data glue only. The LoRIF math lives in
-the tested ``lorif`` package.
+the reusable ``lorif`` package. Release-format token tensors are memory-mapped
+during indexing, and training factors are subsequently consumed in shards.
 """
 
 from __future__ import annotations
@@ -51,11 +52,15 @@ def replace_gpt2_conv1d(model: nn.Module) -> int:
 
 
 def _load_torch(path: Path):
-    return torch.load(path, map_location="cpu", weights_only=True)
+    return torch.load(path, map_location="cpu", weights_only=True, mmap=True)
 
 
-def load_blocks(path: str | Path) -> list[list[int]]:
-    """Load token blocks from the release format or the legacy pickle cache."""
+TokenBlocks = torch.Tensor | list[list[int]]
+TokenBlock = torch.Tensor | list[int]
+
+
+def load_blocks(path: str | Path) -> TokenBlocks:
+    """Memory-map release blocks or load a trusted legacy pickle cache."""
 
     path = Path(path)
     if path.suffix in {".pkl", ".pickle"}:
@@ -64,29 +69,38 @@ def load_blocks(path: str | Path) -> list[list[int]]:
     else:
         value = _load_torch(path)
     if isinstance(value, dict):
-        value = value["input_ids"]
+        try:
+            value = value["input_ids"]
+        except KeyError as error:
+            raise ValueError(f"Missing input_ids in {path}") from error
     if isinstance(value, torch.Tensor):
-        value = value.tolist()
+        if value.ndim != 2:
+            raise ValueError(
+                f"Expected a rank-2 token tensor in {path}, got {tuple(value.shape)}"
+            )
+        return value
     if not isinstance(value, list) or not all(isinstance(row, list) for row in value):
         raise ValueError(f"Expected a list/tensor of token blocks in {path}")
     return value
 
 
 class BlockDataset(Dataset):
-    def __init__(self, blocks: list[list[int]]) -> None:
+    def __init__(self, blocks: TokenBlocks) -> None:
         self.blocks = blocks
 
     def __len__(self) -> int:
         return len(self.blocks)
 
-    def __getitem__(self, index: int) -> list[int]:
+    def __getitem__(self, index: int) -> TokenBlock:
         return self.blocks[index]
 
 
 def collate_blocks(
-    examples: list[list[int]], pad_token_id: int
+    examples: list[TokenBlock], pad_token_id: int
 ) -> dict[str, torch.Tensor]:
-    sequences = [torch.tensor(row, dtype=torch.long) for row in examples]
+    sequences = [torch.as_tensor(row, dtype=torch.long) for row in examples]
+    if any(row.ndim != 1 for row in sequences):
+        raise ValueError("Each token block must be one-dimensional")
     input_ids = pad_sequence(sequences, batch_first=True, padding_value=pad_token_id)
     attention_mask = pad_sequence(
         [torch.ones_like(row) for row in sequences], batch_first=True, padding_value=0
@@ -401,14 +415,19 @@ def _query_losses(
         input_ids = batch["input_ids"].to(device)
         attention_mask = batch["attention_mask"].to(device)
         labels = batch["labels"].to(device)
-        logits = model(input_ids=input_ids, attention_mask=attention_mask).logits
+        logits = model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            use_cache=False,
+        ).logits
         token_losses = F.cross_entropy(
             logits[..., :-1, :].transpose(1, 2),
             labels[..., 1:],
             ignore_index=-100,
             reduction="none",
         )
-        values.append(token_losses.sum(dim=1).cpu())
+        valid_tokens = labels[..., 1:].ne(-100).sum(dim=1).clamp_min(1)
+        values.append((token_losses.sum(dim=1) / valid_tokens).cpu())
     return torch.cat(values)
 
 
@@ -457,11 +476,16 @@ def subset_losses_command(args: argparse.Namespace) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(
+        description="Prepare GPT-2/WikiText data, build LoRIF indexes, or export LDS losses."
+    )
     commands = parser.add_subparsers(dest="command", required=True)
 
-    prepare = commands.add_parser("prepare-wikitext")
-    prepare.add_argument("output")
+    prepare = commands.add_parser(
+        "prepare-wikitext",
+        help="Create the paper-compatible token-block artifact",
+    )
+    prepare.add_argument("output", help="New release-format .pt artifact")
     prepare.add_argument("--tokenizer", default="openai-community/gpt2")
     prepare.add_argument("--revision", default="main")
     prepare.add_argument("--dataset-revision", default="main")
@@ -473,10 +497,16 @@ def build_parser() -> argparse.ArgumentParser:
     prepare.add_argument("--cache-dir")
     prepare.set_defaults(func=prepare_command)
 
-    index = commands.add_parser("index")
-    index.add_argument("model")
-    index.add_argument("data")
-    index.add_argument("output")
+    index = commands.add_parser(
+        "index",
+        help="Build a sharded low-rank gradient-factor index",
+    )
+    index.add_argument("model", help="Hugging Face model ID or local checkpoint")
+    index.add_argument(
+        "data",
+        help="Memory-mapped release .pt artifact or trusted legacy pickle cache",
+    )
+    index.add_argument("output", help="New factor-index directory")
     index.add_argument("--revision", default="main")
     index.add_argument("--tokenizer")
     index.add_argument("--tokenizer-revision", default="main")
@@ -507,9 +537,12 @@ def build_parser() -> argparse.ArgumentParser:
     index.add_argument("--log-every", type=int, default=10)
     index.set_defaults(func=index_command)
 
-    losses = commands.add_parser("subset-losses")
-    losses.add_argument("queries")
-    losses.add_argument("output")
+    losses = commands.add_parser(
+        "subset-losses",
+        help="Export mean next-token cross-entropy losses for LDS",
+    )
+    losses.add_argument("queries", help="Query token-block artifact")
+    losses.add_argument("output", help="New compressed .npz loss matrix")
     losses.add_argument(
         "--checkpoint-pattern",
         action="append",
