@@ -1,7 +1,9 @@
 # LoRIF
 
 Official PyTorch implementation of
-**[LoRIF: Low-Rank Influence Functions for Scalable Training Data Attribution](https://arxiv.org/abs/2601.21929)**.
+**[LoRIF: Pushing the Scalability Frontier of Training Data Attribution](https://arxiv.org/abs/2601.21929)**.
+
+*News: our paper has been accepted to NeurIPS 2026! Welcome to meet the authors in Sydney.*
 
 LoRIF makes influence functions practical for large models by combining two
 low-rank approximations:
@@ -217,11 +219,11 @@ incompatible training and query indexes are rejected.
 ## Citation
 
 ```bibtex
-@article{li2026lorif,
-  title   = {LoRIF: Low-Rank Influence Functions for Scalable Training Data Attribution},
-  author  = {Li, Shuangqi and Le, Hieu and Xu, Jingyi and Salzmann, Mathieu},
-  journal = {arXiv preprint arXiv:2601.21929},
-  year    = {2026}
+@inproceedings{li2026lorif,
+  title     = {LoRIF: Pushing the Scalability Frontier of Training Data Attribution},
+  author    = {Li, Shuangqi and Le, Hieu and Xu, Jingyi and Salzmann, Mathieu},
+  booktitle = {Advances in Neural Information Processing Systems},
+  year      = {2026}
 }
 ```
 
